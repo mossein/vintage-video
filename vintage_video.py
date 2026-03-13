@@ -336,6 +336,10 @@ class GoldenProcessor:
         self.fps = fps
         self.intensity = intensity
 
+        # Process at half resolution for speed (film is inherently soft)
+        self.proc_h = max(1, height // 2)
+        self.proc_w = max(1, width // 2)
+
         # Crosstalk-removal color matrix — blended with identity for control.
         # Full Baselight matrix is too aggressive; we use ~35% strength.
         full_matrix = np.array([
@@ -359,7 +363,7 @@ class GoldenProcessor:
         self.weave_y = BrownianWalk(sigma=0.3 * intensity, spring=0.02)
 
         # Independent grain per separation negative (3 strips = 3 channels)
-        self.grain = TemporalGrain(height, width, channels=3, alpha=0.4, gen_scale=3)
+        self.grain = TemporalGrain(self.proc_h, self.proc_w, channels=3, alpha=0.4, gen_scale=3)
 
         # Pre-build S-curve LUT
         self._build_scurve_lut()
@@ -424,8 +428,11 @@ class GoldenProcessor:
         return np.clip(result, 0, 1).astype(np.float32)
 
     def process_frame(self, frame, frame_idx):
-        h, w = frame.shape[:2]
-        fimg = frame.astype(np.float32) / 255.0
+        orig_h, orig_w = frame.shape[:2]
+        # Downscale to half resolution for speed
+        small = cv2.resize(frame, (self.proc_w, self.proc_h), interpolation=cv2.INTER_AREA)
+        h, w = self.proc_h, self.proc_w
+        fimg = small.astype(np.float32) / 255.0
 
         # 0. FILM SOFTNESS (1950s lenses were not sharp like modern glass)
         fimg = cv2.GaussianBlur(fimg, (3, 3), 0.8)
@@ -448,16 +455,38 @@ class GoldenProcessor:
         transformed = transformed / max_vals
         rgb = transformed.reshape(h, w, 3).astype(np.float32)
 
+        # 2b. DIFFERENTIAL CHANNEL SHARPNESS (green sharpest, red softest)
+        # Real 3-strip: green via direct beam splitter, red through blue bipack
+        rgb[:, :, 0] = cv2.GaussianBlur(rgb[:, :, 0], (0, 0), 0.8)  # Red softest
+        rgb[:, :, 2] = cv2.GaussianBlur(rgb[:, :, 2], (0, 0), 0.5)  # Blue medium
+
         # 3. STEEP S-CURVE CONTRAST
         rgb = apply_lut(np.clip(rgb, 0, 1), self.scurve_lut)
 
-        # 4. WARMTH SHIFT (Technicolor receiving stock warm bias)
-        rgb[:, :, 0] *= 1.06  # R slightly up
-        rgb[:, :, 2] *= 0.92  # B slightly down
+        # 4. WARMTH SHIFT (shadow-neutral — real IB prints have deep neutral blacks)
+        lum_warmth = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+        warmth_mask = np.clip(lum_warmth * 2.5, 0, 1)  # 0 in shadows, 1 in mids/highs
+        rgb[:, :, 0] *= 1.0 + 0.06 * warmth_mask  # R up in mids/highs only
+        rgb[:, :, 2] *= 1.0 - 0.08 * warmth_mask  # B down in mids/highs only
         rgb = np.clip(rgb, 0, 1)
 
         # 5. PER-HUE SATURATION BOOST
         rgb = self._per_hue_saturation(rgb)
+
+        # 5b. HELMHOLTZ-KOHLRAUSCH LUMINANCE BOOST (saturated dyes appear self-luminous)
+        lum_hk = (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2])[:, :, np.newaxis]
+        chroma_hk = np.sqrt(np.sum((rgb - lum_hk) ** 2, axis=2))
+        hk_boost = chroma_hk * 0.08 * self.intensity
+        rgb = np.clip(rgb + hk_boost[:, :, np.newaxis], 0, 1).astype(np.float32)
+
+        # 5c. DYE TRANSFER BLEED (chemical softness at saturated color boundaries)
+        lum_g4 = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+        chroma_g4 = np.sqrt(np.sum((rgb - lum_g4[:, :, np.newaxis]) ** 2, axis=2))
+        chroma_edges = np.abs(cv2.Sobel(chroma_g4, cv2.CV_32F, 1, 0)) + \
+                       np.abs(cv2.Sobel(chroma_g4, cv2.CV_32F, 0, 1))
+        bleed_mask = np.clip(chroma_edges * 3.0, 0, 1)[:, :, np.newaxis]
+        rgb_blurred = cv2.GaussianBlur(rgb, (5, 5), 1.5)
+        rgb = (rgb * (1.0 - bleed_mask * 0.4) + rgb_blurred * (bleed_mask * 0.4)).astype(np.float32)
 
         # 6. HIGHLIGHT PROTECTION — keep highlights luminous white, no color cast
         lum = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
@@ -500,10 +529,14 @@ class GoldenProcessor:
                                            0.02 * self.intensity))
 
         # 9. INDEPENDENT GRAIN PER CHANNEL (3-strip = 3 negatives)
+        # IB dye transfer suppresses grain; green finest, red coarsest
         grains = self.grain.generate()
+        grains[1] = cv2.GaussianBlur(grains[1], (3, 3), 0.8)  # green finest
+        grains[0] = cv2.GaussianBlur(grains[0], (3, 3), 0.5)  # blue medium
+        # red (grains[2]) unblurred — coarsest
         gray = 0.299 * result[:, :, 2] + 0.587 * result[:, :, 1] + 0.114 * result[:, :, 0]
         grain_resp = np.clip(np.sqrt(4.0 * gray * (1.0 - gray)), 0.2, 1.0)
-        grain_intensity = 0.07 * self.intensity
+        grain_intensity = 0.05 * self.intensity
         for c in range(3):
             result[:, :, c] = soft_light_blend(
                 np.clip(result[:, :, c], 0, 1),
@@ -530,6 +563,9 @@ class GoldenProcessor:
         M = np.float32([[1, 0, dx_shift], [0, 1, dy_shift]])
         result_u8 = (np.clip(result, 0, 1) * 255).astype(np.uint8)
         result_u8 = cv2.warpAffine(result_u8, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+
+        # Upscale back to original resolution
+        result_u8 = cv2.resize(result_u8, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
         return result_u8
 
@@ -590,12 +626,16 @@ class VHSProcessor:
         self.hue_walk = BrownianWalk(sigma=0.008, spring=0.05, initial=0.0,
                                       bounds=(-0.04, 0.04))
 
+        # Tape saturation LUT — nonlinear soft-knee compression (tanh-based)
+        x = np.linspace(0, 1, 4096, dtype=np.float32)
+        self.tape_sat_lut = (np.tanh((x - 0.5) * 3.0) * 0.375 + 0.445).astype(np.float32)
+
         # Store previous frame for interlacing
         self.prev_frame = None
 
-        # Camcorder shake — VHS camcorders had no stabilization
-        self.shake_x = BrownianWalk(sigma=1.2 * intensity, spring=0.015)
-        self.shake_y = BrownianWalk(sigma=0.8 * intensity, spring=0.015)
+        # Camcorder shake — disabled (other artifacts carry the VHS feel)
+        # self.shake_x = BrownianWalk(sigma=1.2 * intensity, spring=0.015)
+        # self.shake_y = BrownianWalk(sigma=0.8 * intensity, spring=0.015)
 
     def _rgb_to_yiq(self, rgb):
         r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
@@ -619,9 +659,9 @@ class VHSProcessor:
         small = cv2.resize(frame, (self.vhs_w, self.vhs_h), interpolation=cv2.INTER_AREA)
         fimg = small.astype(np.float32) / 255.0
 
-        # 0. CONTRAST REDUCTION + BLACK LIFT (the biggest VHS signature)
-        # Real VHS has milky blacks, reduced dynamic range — not digital crispness
-        fimg = fimg * 0.75 + 0.07
+        # 0. TAPE SATURATION (nonlinear soft-knee compression — the biggest VHS signature)
+        # Real tape has milky blacks, soft-knee highlight compression, not linear
+        fimg = apply_lut(fimg, self.tape_sat_lut)
 
         # 0b. SPATIAL SOFTNESS (head wear, tape contact, write-read gap)
         fimg = cv2.GaussianBlur(fimg, (3, 3), 0.6)
@@ -651,13 +691,23 @@ class VHSProcessor:
         i_filtered = np.roll(i_filtered, shift, axis=1)
         q_filtered = np.roll(q_filtered, shift, axis=1)
 
-        # 5. NOISE (clearly visible — real VHS has obvious noise)
-        y_filtered += np.random.normal(0, 0.025 * self.intensity,
-                                        y_filtered.shape).astype(np.float32)
-        i_filtered += np.random.normal(0, 0.012 * self.intensity,
-                                        i_filtered.shape).astype(np.float32)
-        q_filtered += np.random.normal(0, 0.012 * self.intensity,
-                                        q_filtered.shape).astype(np.float32)
+        # 5. NOISE — horizontally correlated (VHS noise is streaky along scan lines)
+        y_noise = np.random.normal(0, 0.025 * self.intensity,
+                                    y_filtered.shape).astype(np.float32)
+        y_noise = gaussian_filter1d(y_noise, sigma=2.5, axis=1)
+        y_filtered += y_noise
+        # Context-dependent chroma noise (worse in saturated reds — color-under 629 kHz)
+        i_noise = np.random.normal(0, 0.012 * self.intensity,
+                                    i_filtered.shape).astype(np.float32)
+        q_noise = np.random.normal(0, 0.012 * self.intensity,
+                                    q_filtered.shape).astype(np.float32)
+        i_noise = gaussian_filter1d(i_noise, sigma=2.5, axis=1)
+        q_noise = gaussian_filter1d(q_noise, sigma=2.5, axis=1)
+        sat_level = np.sqrt(i_filtered ** 2 + q_filtered ** 2)
+        red_weight = 1.0 + np.clip(i_filtered, 0, None) * 1.5
+        chroma_scale = (0.5 + sat_level * 2.0) * red_weight
+        i_filtered += i_noise * chroma_scale
+        q_filtered += q_noise * chroma_scale
 
         # 5b. LUMA TRAILING — bright objects leave rightward trail (FM recording artifact)
         trail = np.zeros_like(y_filtered)
@@ -686,7 +736,13 @@ class VHSProcessor:
         # 6c. BRIGHTNESS GAIN + HIGHLIGHT COMPRESSION
         # VHS playback has slight brightness lift; whites bloom/smear (can't hold bright whites)
         result = result * 1.08
-        result = np.clip(result, 0, 0.92)  # compress highlights — VHS can't hold bright whites
+        # FM HIGHLIGHT BLOOM (bright areas spread horizontally — FM can't hold peaks)
+        bright_mask = np.clip((result - 0.85) / 0.15, 0, 1)
+        bloom_h = result * bright_mask
+        for c in range(3):
+            bloom_h[:, :, c] = gaussian_filter1d(bloom_h[:, :, c], sigma=8, axis=1)
+        result = result * (1.0 - bright_mask * 0.5) + bloom_h * 0.5
+        result = np.clip(result, 0, 0.92)
 
         # 7. COLOR DEGRADATION — warm shift, slight desaturation
         result[:, :, 2] = np.clip(result[:, :, 2] * 1.05, 0, 1)  # Red push
@@ -716,14 +772,19 @@ class VHSProcessor:
             result[hs_y:end_y] += np.random.normal(
                 0, 0.06, result[hs_y:end_y].shape).astype(np.float32)
 
-        # 10. RARE DROPOUTS (p<0.05)
+        # 10. RARE DROPOUTS — bright horizontal streak with exponential decay tail
         if np.random.random() < 0.05 * self.intensity:
             dy = np.random.randint(0, self.vhs_h)
             dx_start = np.random.randint(0, self.vhs_w // 2)
             dx_len = np.random.randint(20, 120)
             dx_end = min(dx_start + dx_len, self.vhs_w)
-            if dy > 0:
-                result[dy, dx_start:dx_end] = result[dy - 1, dx_start:dx_end]
+            streak_len = dx_end - dx_start
+            if streak_len > 0:
+                decay = np.exp(-np.linspace(0, 4, streak_len)).astype(np.float32)
+                brightness = 0.7 + np.random.uniform(0, 0.25)
+                for c in range(3):
+                    result[dy, dx_start:dx_end, c] = np.clip(
+                        result[dy, dx_start:dx_end, c] + brightness * decay, 0, 1)
 
         result = np.clip(result, 0, 1)
 
@@ -736,14 +797,9 @@ class VHSProcessor:
                 result[row] = self.prev_frame[row]
         self.prev_frame = result.copy()
 
-        # 12. CAMCORDER SHAKE (VHS camcorders had no stabilization)
-        sx = self.shake_x.step()
-        sy = self.shake_y.step()
-        M_shake = np.float32([[1, 0, sx], [0, 1, sy]])
+        # 12. Convert to uint8
         result = np.clip(result, 0, 1)
         result_u8 = (result * 255).astype(np.uint8)
-        result_u8 = cv2.warpAffine(result_u8, M_shake, (self.vhs_w, self.vhs_h),
-                                    borderMode=cv2.BORDER_REFLECT)
 
         # 13. Upscale back to original resolution
         result_u8 = cv2.resize(result_u8, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -776,6 +832,10 @@ class CinematicProcessor:
         self.fps = fps
         self.intensity = intensity
 
+        # Process at half resolution for speed
+        self.proc_h = max(1, height // 2)
+        self.proc_w = max(1, width // 2)
+
         # Initialize spectral film conversion
         self.film_conv = None
         self.film_neg = None
@@ -799,56 +859,74 @@ class CinematicProcessor:
         self.weave_y = BrownianWalk(sigma=0.25 * intensity, spring=0.04)
 
         # Grain: independent per frame (alpha=0), per-channel, half-res for clumping
-        self.grain = TemporalGrain(height, width, channels=3, alpha=0.0, gen_scale=2)
+        self.grain = TemporalGrain(self.proc_h, self.proc_w, channels=3, alpha=0.0, gen_scale=2)
+        # C4: Coarse grain for shadows (fewer, larger crystals)
+        self.grain_coarse = TemporalGrain(self.proc_h, self.proc_w, channels=3, alpha=0.0, gen_scale=4)
 
-        # Film breath oscillator
+        # Film breath oscillators (exposure + contrast + color temperature)
         self.breath_t = 0.0
         self.breath_f1 = 0.08 + np.random.uniform(-0.02, 0.02)
         self.breath_f2 = 0.17 + np.random.uniform(-0.04, 0.04)
         self.breath_phi1 = np.random.uniform(0, 2 * np.pi)
         self.breath_phi2 = np.random.uniform(0, 2 * np.pi)
+        # C3: contrast drift oscillator
+        self.breath_contrast_f = 0.05 + np.random.uniform(-0.01, 0.01)
+        self.breath_contrast_phi = np.random.uniform(0, 2 * np.pi)
+        # C3: color temperature drift oscillators (R and B)
+        self.breath_temp_f = 0.03 + np.random.uniform(-0.01, 0.01)
+        self.breath_temp_phi = np.random.uniform(0, 2 * np.pi)
 
         # Pre-build highlight soft-clip LUT
         self._build_softclip_lut()
 
     def _build_softclip_lut(self):
-        """Highlight soft-clip: film's #1 characteristic — graceful highlight rolloff.
-        Digital hard-clips to white; film compresses smoothly.
-        Subtle — just compresses the top stop, not a heavy effect."""
+        """Per-channel highlight soft-clip: film emulsion layers clip independently.
+        Blue clips first, then green, then red — produces warm-colored highlights."""
         x = np.linspace(0, 1, 4096, dtype=np.float32)
-        # Soft knee starting at ~0.7, gentle compression above
         k = 2.5
-        knee = 0.70
-        out = np.where(
-            x <= knee,
-            x,
-            knee + (1.0 - knee) * (1.0 - np.exp(-k * (x - knee) / (1.0 - knee))) /
-            (1.0 - np.exp(-k))
-        )
-        self.softclip_lut = out.astype(np.float32)
+        # C1: Per-channel rolloff with different knee points (BGR order)
+        knees = {'b': 0.65, 'g': 0.70, 'r': 0.75}
+        self.softclip_luts = {}
+        for ch, knee in knees.items():
+            out = np.where(
+                x <= knee,
+                x,
+                knee + (1.0 - knee) * (1.0 - np.exp(-k * (x - knee) / (1.0 - knee))) /
+                (1.0 - np.exp(-k))
+            )
+            self.softclip_luts[ch] = out.astype(np.float32)
+        self.softclip_lut = self.softclip_luts['g']  # default fallback
 
     def process_frame(self, frame, frame_idx):
-        h, w = frame.shape[:2]
-        fimg = frame.astype(np.float32) / 255.0
+        orig_h, orig_w = frame.shape[:2]
+        # Downscale to half resolution for speed
+        small = cv2.resize(frame, (self.proc_w, self.proc_h), interpolation=cv2.INTER_AREA)
+        h, w = self.proc_h, self.proc_w
+        fimg = small.astype(np.float32) / 255.0
 
-        # 1. HIGHLIGHT SOFT-CLIP (cheapest effect, biggest payoff)
-        # Apply before everything — this prevents the washed-out look
-        fimg = apply_lut(fimg, self.softclip_lut)
+        # 1. PER-CHANNEL HIGHLIGHT SOFT-CLIP (blue clips first → warm highlights)
+        fimg[:, :, 0] = apply_lut(fimg[:, :, 0], self.softclip_luts['b'])  # Blue
+        fimg[:, :, 1] = apply_lut(fimg[:, :, 1], self.softclip_luts['g'])  # Green
+        fimg[:, :, 2] = apply_lut(fimg[:, :, 2], self.softclip_luts['r'])  # Red
 
         # 2. FILM SOFTNESS (remove digital crispness — film has specific MTF curve)
         fimg = cv2.GaussianBlur(fimg, (3, 3), 1.2)
 
-        # 3. NEGATIVE → PRINT CONVERSION (at half resolution for speed)
+        # 3. NEGATIVE → PRINT CONVERSION (already at half resolution)
         if self.film_conv is not None:
-            # Downscale for conversion
-            half_h, half_w = max(1, h // 2), max(1, w // 2)
-            small = cv2.resize(fimg, (half_w, half_h), interpolation=cv2.INTER_AREA)
-            converted = self.film_conv(small.reshape(-1, 3))
-            small_conv = np.clip(converted.reshape(half_h, half_w, 3), 0, 1).astype(np.float32)
-            # Upscale back
-            fimg = cv2.resize(small_conv, (w, h), interpolation=cv2.INTER_LINEAR)
+            converted = self.film_conv(fimg.reshape(-1, 3))
+            fimg = np.clip(converted.reshape(h, w, 3), 0, 1).astype(np.float32)
         else:
-            # Fallback: manual warm/teal grade with S-curve
+            # Fallback: cross-coupling matrix (inter-layer chemical interaction) + grade
+            # Simulates how neg emulsion layers interact during development
+            xc_matrix = np.array([
+                [ 1.02, -0.02,  0.04],  # B picks up slight R
+                [ 0.01,  1.00, -0.03],  # G slightly loses B
+                [-0.03,  0.05,  1.02],  # R picks up slight G
+            ], dtype=np.float32)
+            pixels = fimg.reshape(-1, 3)
+            fimg = np.clip((pixels @ xc_matrix.T).reshape(h, w, 3), 0, 1).astype(np.float32)
+            # Manual warm/teal grade with S-curve
             gray = np.mean(fimg, axis=2)
             shadow_mask = np.clip(1.0 - gray * 2, 0, 1)
             highlight_mask = np.clip(gray * 2 - 1, 0, 1)
@@ -867,9 +945,17 @@ class CinematicProcessor:
                                          0.06 * self.intensity,
                                          0.02 * self.intensity))
 
-        # 5. GRAIN — independent per frame, exposure-dependent, per-channel
-        grains = self.grain.generate()
-        grain_intensity = 0.07 * self.intensity  # clearly visible film grain
+        # 4b. VEILING FLARE (film-era lenses — global contrast reduction from bright areas)
+        gray_vf = 0.299 * fimg[:, :, 2] + 0.587 * fimg[:, :, 1] + 0.114 * fimg[:, :, 0]
+        highlight_energy = np.mean(np.clip(gray_vf - 0.6, 0, 1))
+        flare_strength = highlight_energy * 0.15 * self.intensity
+        fimg = fimg * (1.0 - flare_strength) + flare_strength * 0.3  # lift shadows, reduce contrast
+        fimg = np.clip(fimg, 0, 1).astype(np.float32)
+
+        # 5. DUAL-SCALE GRAIN — fine grain (midtones/highlights) + coarse grain (shadows)
+        grains_fine = self.grain.generate()
+        grains_coarse = self.grain_coarse.generate()
+        grain_intensity = 0.07 * self.intensity
 
         if self.film_neg is not None:
             try:
@@ -878,31 +964,49 @@ class CinematicProcessor:
                 gf = self.film_neg.grain_transform(
                     pixels, scale=scale / 160.0, std_div=1.0
                 ).reshape(h, w, 3).astype(np.float32)
-                fimg[:, :, 2] += grains[0] * gf[:, :, 0]
-                fimg[:, :, 1] += grains[1] * gf[:, :, 1]
-                fimg[:, :, 0] += grains[2] * gf[:, :, 2]
+                # Blend fine/coarse grain by luminance
+                lum = np.mean(fimg, axis=2)
+                shadow_w = np.clip(1.0 - lum * 2.5, 0, 1)  # coarse in shadows
+                highlight_w = 1.0 - shadow_w  # fine in mids/highs
+                for ci, co in [(2, 0), (1, 1), (0, 2)]:
+                    combined = grains_fine[co] * highlight_w + grains_coarse[co] * shadow_w
+                    fimg[:, :, ci] += combined * gf[:, :, co]
             except Exception:
                 lum = np.mean(fimg, axis=2)
                 lum_resp = np.clip(np.sqrt(4 * lum * (1 - lum)), 0.3, 1.0)
-                fimg[:, :, 2] += grains[0] * grain_intensity * lum_resp
-                fimg[:, :, 1] += grains[1] * grain_intensity * 0.9 * lum_resp
-                fimg[:, :, 0] += grains[2] * grain_intensity * 1.1 * lum_resp
+                shadow_w = np.clip(1.0 - lum * 2.5, 0, 1)
+                highlight_w = 1.0 - shadow_w
+                for ci, co, scale in [(2, 0, 1.0), (1, 1, 0.9), (0, 2, 1.1)]:
+                    combined = grains_fine[co] * highlight_w + grains_coarse[co] * shadow_w
+                    fimg[:, :, ci] += combined * grain_intensity * scale * lum_resp
         else:
             lum = np.mean(fimg, axis=2)
             lum_resp = np.clip(np.sqrt(4 * lum * (1 - lum)), 0.3, 1.0)
-            fimg[:, :, 2] += grains[0] * grain_intensity * lum_resp
-            fimg[:, :, 1] += grains[1] * grain_intensity * 0.9 * lum_resp
-            fimg[:, :, 0] += grains[2] * grain_intensity * 1.1 * lum_resp
+            shadow_w = np.clip(1.0 - lum * 2.5, 0, 1)
+            highlight_w = 1.0 - shadow_w
+            for ci, co, scale in [(2, 0, 1.0), (1, 1, 0.9), (0, 2, 1.1)]:
+                combined = grains_fine[co] * highlight_w + grains_coarse[co] * shadow_w
+                fimg[:, :, ci] += combined * grain_intensity * scale * lum_resp
 
-        # 6. FILM BREATH (low-frequency per-frame exposure micro-variation)
+        # 6. FILM BREATH (exposure + contrast + color temperature micro-variation)
         dt = 1.0 / max(self.fps, 1)
         self.breath_t += dt
         t = self.breath_t
+        # Exposure drift
         breath = 1.0 + self.intensity * 0.025 * (
             np.sin(2 * np.pi * self.breath_f1 * t + self.breath_phi1) * 0.6 +
             np.sin(2 * np.pi * self.breath_f2 * t + self.breath_phi2) * 0.4
         )
         fimg = fimg * breath
+        # Contrast drift (low-frequency sinusoidal)
+        contrast_drift = 1.0 + self.intensity * 0.015 * np.sin(
+            2 * np.pi * self.breath_contrast_f * t + self.breath_contrast_phi)
+        fimg = 0.5 + (fimg - 0.5) * contrast_drift
+        # Color temperature drift (R/B channels)
+        temp_drift = self.intensity * 0.008 * np.sin(
+            2 * np.pi * self.breath_temp_f * t + self.breath_temp_phi)
+        fimg[:, :, 2] *= 1.0 + temp_drift   # Red
+        fimg[:, :, 0] *= 1.0 - temp_drift   # Blue
 
         # 7. BLOOM (soft highlight glow)
         fimg = np.clip(fimg, 0, 1)
@@ -932,6 +1036,9 @@ class CinematicProcessor:
         M = np.float32([[1, 0, dx_shift], [0, 1, dy_shift]])
         result_u8 = (np.clip(fimg, 0, 1) * 255).astype(np.uint8)
         result_u8 = cv2.warpAffine(result_u8, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+
+        # Upscale back to original resolution
+        result_u8 = cv2.resize(result_u8, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
         return result_u8
 

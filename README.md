@@ -27,26 +27,30 @@ Technicolor's 3-strip process was wild. Three separate strips of black-and-white
 
 The color science here uses the Baselight crosstalk-removal approach — the same math used in professional color grading to reverse-engineer the Technicolor look. A crosstalk-removal matrix removes the green contamination that modern cameras capture but Technicolor's optical system didn't, producing that distinctive color separation where reds are *red* and blues are *blue* without the muddy overlap.
 
-Because three separate negatives were involved, each had its own grain pattern and slight registration errors. You can see this as subtle color fringing at edges — the RGB channels don't quite line up, shifting independently frame to frame on Brownian walks. The grain is also independent per channel, three separate noise fields rather than one.
+Because three separate negatives were involved, each had its own grain pattern and slight registration errors. You can see this as subtle color fringing at edges — the RGB channels don't quite line up, shifting independently frame to frame on Brownian walks. The grain is also independent per channel, three separate noise fields rather than one — and each channel has different grain character. Green grain is finest (direct beam splitter exposure), red is coarsest (exposed through the blue bipack), matching the real 3-strip optical path. The IB dye transfer process suppressed grain overall compared to conventional prints.
 
 The bloom is warm because Technicolor projection pushed light through dye layers that absorbed more blue than red, so bright areas glow with a warm halo. The halation comes from light scattering through the emulsion and bouncing off the film base — it shows up as a warm glow around highlights.
+
+Shadows stay neutral deep black — real IB prints had clean, neutral shadows with the warmth only appearing in midtones and highlights. The Helmholtz-Kohlrausch effect is modeled too: saturated Technicolor dyes were spectrally pure, making vivid colors appear self-luminous, so a small luminance boost is added proportional to chroma. At saturated color boundaries, a dye transfer bleed effect softens edges where the sequential dye absorption into gelatin created chemical softness.
 
 ### VHS — 1990s Tape
 ![VHS](examples/vhs.gif)
 
 This one took the most iteration to get right, because VHS doesn't just look "soft" — it looks *cheap* in a very specific way.
 
-The pipeline starts by crushing the dynamic range. Real VHS has milky blacks and compressed whites because the tape physically can't hold the full brightness range. Blacks never hit true black; whites bloom before they get to full white. This contrast reduction is actually the single biggest difference between "digital video with a blur" and "actual tape."
+The pipeline starts with tape saturation — a nonlinear tanh-based soft-knee compression curve, not a linear contrast reduction. Real magnetic tape has a characteristic S-shaped transfer curve: milky blacks that never hit true black, and a soft shoulder on highlights where the oxide particles magnetically saturate. This nonlinearity is the single biggest difference between "digital video with a blur" and "actual tape."
 
 Then comes the signal processing. VHS records in YIQ color space (the NTSC standard), and the luma channel gets about 2.5 MHz of bandwidth while chroma gets a pathetic 500 kHz. In practice, this means brightness detail is soft but chrominance is absolutely smeared — colors bleed horizontally across the frame in a way that's distinctly different from just blurring the whole image. We apply IIR Butterworth filters at these exact cutoff frequencies, which naturally produce the edge ringing (overshoot on brightness transitions) that VHS is known for.
 
+The noise is horizontally correlated — real VHS noise comes from the scanning head reading the tape, so it's streaky along scan lines rather than the isotropic Gaussian that most VHS effects use. Chroma noise is also context-dependent: the color-under 629 kHz system degrades worse in saturated reds, so noisy VHS footage gets noisier in red areas, matching real tape behavior.
+
 On top of that bandwidth limiting, VCRs had built-in sharpening circuits that tried to compensate for the softness. This creates a paradox that's key to the VHS look: the image is simultaneously soft (low bandwidth) AND has bright/dark halos around edges (from the sharpening). Most VHS effects miss this entirely.
+
+Bright areas exhibit FM highlight bloom — the FM recording system can't hold brightness peaks, so overexposed areas spread horizontally with a soft glow rather than hard-clipping. Tape dropouts appear as bright horizontal streaks with exponential decay tails, not as copied-from-previous-line artifacts.
 
 The interlacing is essential. VHS is natively 480i — each frame is two fields captured at different moments. When something moves, you get combing artifacts where the even and odd scanlines show the object in slightly different positions. This is immediately recognizable as "video" rather than "film" and it's completely absent from progressive digital footage.
 
-The camcorder shake breaks the digital stabilization. Real VHS camcorders had no optical or electronic stabilization, so handheld footage has a characteristic low-frequency wobble. The hue instability ("Never The Same Color" — the old joke about NTSC) comes from the color-under recording process introducing slight phase errors frame to frame.
-
-Head-switching noise at the bottom of the frame, timebase jitter giving scanlines slight horizontal wobble, occasional tape dropouts — these are all modeled as stochastic processes rather than static overlays.
+The hue instability ("Never The Same Color" — the old joke about NTSC) comes from the color-under recording process introducing slight phase errors frame to frame. Head-switching noise at the bottom of the frame, timebase jitter giving scanlines slight horizontal wobble — these are all modeled as stochastic processes rather than static overlays.
 
 ### Cinematic — Modern Film (Vision3 500T)
 ![Cinematic](examples/cinematic.gif)
@@ -55,13 +59,13 @@ This models what happens when you shoot on Kodak Vision3 500T negative stock and
 
 The conversion uses `spectral_film_lut`, a library that models the actual spectral sensitivity curves and dye densities of real film stocks. It's not a color LUT approximation — it computes what each wavelength of light does to each emulsion layer, accounting for spectral crosstalk between layers, the Hurter-Driffield characteristic curve of each stock, and the color temperature of both the taking light and the projection lamp.
 
-The highlight soft-clip is film's most important visual signature. Digital sensors hard-clip to pure white; film compresses highlights smoothly along a shoulder curve. A bright window in digital footage is a blown-out white rectangle. On film, it rolls off gracefully, holding detail and color even in extreme highlights. We apply this as the very first step — before color conversion — using a soft-knee curve that starts compressing around 70% brightness.
+The highlight soft-clip is per-channel — film emulsion layers clip independently, with blue saturating first (knee at 0.65), then green (0.70), then red (0.75). This produces the warm-colored highlights that are a dead giveaway of film: overexposed areas shift warm because the blue layer has already rolled off while red is still holding detail. Digital hard-clips all channels at the same point; film doesn't.
 
-Halation is physically accurate: light passes through the emulsion layers (which are stacked Blue-Green-Red from lens to base), hits the film base, bounces back, and scatters. Because red is the deepest layer (closest to the base), halation is predominantly red/warm — that's why film highlights glow warm rather than cool.
+Halation is physically accurate: light passes through the emulsion layers (which are stacked Blue-Green-Red from lens to base), hits the film base, bounces back, and scatters. Because red is the deepest layer (closest to the base), halation is predominantly red/warm — that's why film highlights glow warm rather than cool. After halation, a veiling flare effect models the global contrast reduction from uncoated film-era lens elements — bright areas in the scene create a proportional milky lift across the whole frame, reducing shadow contrast.
 
-The grain is independent per frame (alpha=0 temporal coherence, unlike VHS which has sticky grain) because each frame of film is a completely independent exposure of silver halide crystals. It's also exposure-dependent — grain is most visible in midtones, less in deep shadows (where there's little exposure) and highlights (where heavy exposure produces smoother density). When the spectral film library is available, we use its actual grain model; otherwise we approximate with a luminance-response curve.
+The grain is dual-scale: fine grain (from small, densely packed silver halide crystals) dominates in midtones and highlights, while coarser grain (fewer, larger crystals with less exposure) shows up in shadows. This is blended by a luminance mask so the grain character shifts naturally across the tonal range. Each frame is independent (alpha=0 temporal coherence, unlike VHS which has sticky grain) because each frame of film is a completely independent exposure. When the spectral film library is available, we use its actual grain model; otherwise we approximate with a luminance-response curve. When even the spectral library isn't installed, a 3x3 cross-coupling matrix simulates inter-layer chemical interaction before the fallback color grade.
 
-Film breath — the subtle per-frame exposure variation from gate flutter and developing inconsistencies — uses low-frequency sinusoidal oscillation so the brightness drifts gently rather than jumping randomly. Gate weave is Brownian, reflecting the mechanical reality of a film transport mechanism where the current position depends on the previous position.
+Film breath goes beyond just exposure — real film also drifts in contrast (from developing temperature variation) and color temperature (from slight voltage changes in the printer light). Three independent low-frequency oscillators create exposure, contrast, and R/B color temperature drift that make the image feel alive rather than just flickering. Gate weave is Brownian, reflecting the mechanical reality of a film transport mechanism where the current position depends on the previous position.
 
 ## How It Works
 
@@ -69,7 +73,7 @@ The processor reads video frames through ffmpeg pipes (no temp files, no quality
 
 Each mode is a class with a `process_frame(frame, frame_idx)` method. Stateful effects (gate weave, flicker, grain temporal coherence, camcorder shake) are initialized once and evolve frame to frame, so they're temporally coherent rather than randomly regenerated.
 
-The processing happens at native resolution for film modes but downscales to 720x480 for VHS (real NTSC resolution) before applying effects, then upscales back. This means the VHS softness comes from both the bandwidth limiting AND the resolution loss, just like real tape.
+The processing happens at half resolution for Golden and Cinematic modes (film is inherently soft — the sharpness lost to downscaling was being deliberately removed by lens blur anyway) and at 720x480 for VHS (real NTSC resolution), then upscales back. This gives roughly 4x speedup for the film modes without visible quality loss, since grain, bloom, halation, and gate weave are all resolution-independent effects.
 
 ## Usage
 
