@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Source videos and outputs (too large for git)
+*.MOV
+*.mp4
+*.mov
+
+# Keep example GIFs
+!examples/*.gif
